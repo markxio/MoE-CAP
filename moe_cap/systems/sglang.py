@@ -16,6 +16,8 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import Withable
 from sglang.srt.environ import envs
+from sglang.srt.managers.io_struct import ExpertDistributionReq, BaseReq, ExpertDistributionReqType
+import dataclasses
 
 from typing import Optional, Tuple, Union, List, Literal
 import time
@@ -29,6 +31,11 @@ import json
 
 _OutputMode = Literal["file", "object"]
 
+@dataclasses.dataclass
+class ExpertDistributionReq2(BaseReq):
+    action: ExpertDistributionReqType
+
+
 def _dump_to_file(name, data):
     save_dir = envs.SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR.get()
     path_output = f"{save_dir}/{name}"
@@ -38,6 +45,7 @@ def _dump_to_file(name, data):
     torch.save(data, str(path_output))
 
 sglang_eplb_expert_distribution._dump_to_file = _dump_to_file
+ExpertDistributionReq = ExpertDistributionReq2
 
 class _ExpertDistributionRecorderReal2(ExpertDistributionRecorder):
     def __init__(
