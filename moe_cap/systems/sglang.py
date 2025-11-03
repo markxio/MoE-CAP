@@ -5,10 +5,10 @@ from sglang.srt.eplb.expert_distribution import (
     _Accumulator,
     _SinglePassGatherer
 )
+
 import sglang.srt.eplb.expert_distribution as sglang_eplb_expert_distribution
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
-from sglang.srt.entrypoints.http_server import launch_server
 from sglang.srt.server_args import prepare_server_args
 from sglang.srt.utils import kill_process_tree
 from sglang.srt.eplb.expert_location import ExpertLocationMetadata
@@ -36,6 +36,13 @@ _OutputMode = Literal["file", "object"]
 class ExpertDistributionReq2(BaseReq):
     action: ExpertDistributionReqType
 
+# Fix the module and qualname so pickle can find it correctly
+ExpertDistributionReq2.__module__ = iostruct.ExpertDistributionReq.__module__
+ExpertDistributionReq2.__qualname__ = iostruct.ExpertDistributionReq.__qualname__
+ExpertDistributionReq2.__name__ = iostruct.ExpertDistributionReq.__name__
+
+iostruct.ExpertDistributionReq = ExpertDistributionReq2
+
 
 def _dump_to_file(name, data):
     save_dir = envs.SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR.get()
@@ -46,7 +53,7 @@ def _dump_to_file(name, data):
     torch.save(data, str(path_output))
 
 sglang_eplb_expert_distribution._dump_to_file = _dump_to_file
-iostruct.ExpertDistributionReq = ExpertDistributionReq2
+
 
 class _ExpertDistributionRecorderReal2(ExpertDistributionRecorder):
     def __init__(
@@ -289,6 +296,7 @@ ModelRunner.forward = forward_expert_record
 sglang_eplb_expert_distribution._ExpertDistributionRecorderReal = _ExpertDistributionRecorderReal2
 
 if __name__ == "__main__":
+    from sglang.srt.entrypoints.http_server import launch_server
     server_args = prepare_server_args(sys.argv[1:])
 
     try:
