@@ -86,7 +86,7 @@ class HFModelInfoRetriever(BaseModelInfoRetriever):
             return 2.0
         if p in ("int8", "fp8"):
             return 1.0
-        if p in ("int4", "fp4"):
+        if p in ("int4", "fp4", "awq", "gptq"):
             return 0.5
         return 2.0  
 

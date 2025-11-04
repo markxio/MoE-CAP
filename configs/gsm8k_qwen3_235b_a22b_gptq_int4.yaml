@@ -1,0 +1,7 @@
+dataset_names: ["gsm8k"]
+
+metrics: ["em", "f1"]
+
+model_id: Qwen/Qwen3-235B-A22B-GPTQ-Int4
+
+precision: gptq
