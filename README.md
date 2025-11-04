@@ -1,11 +1,13 @@
 # MoE-CAP
 
+MoE-CAP is a benchmarking method designed to evaluate sparse MoE systems by integrating Cost, Accuracy, and Performance across these three dimensions.
+
 ## Requirements
 Python: >= 3.9
 
 ## Installation
 ```bash
-git clone https://github.com/SecretSettler/MoE-CAP.git
+git clone https://github.com/sparse-generative-ai/MoE-CAP.git
 cd MoE-CAP
 pip install -e .
 ```
@@ -27,6 +29,36 @@ python -m moe_cap.runner.sglang_profile \
         --config-file configs/gsm8k_qwen3_235b_a22b.yaml \
         --output_dir outputs/
 ```
+
+The results will be stored under `outputs/`.
+
+## Radar Plot Example:
+![CAP Radar](assets/radar.png)
+
+## Contributing to MoE-CAP
+
+Thank you for your interest in contributing to the MoE-CAP project! We welcome contributions from everyone. Below you'll find guidance on how to set up your development environment, understand our architecture, and contribute effectively. If you have any questions or wish to discuss your contributions, please reach out to Yinsicheng Jiang or Yao Fu via email at [ysc.jiang@ed.ac.uk](mailto:ysc.jiang@ed.ac.uk) or [Y.Fu@ed.ac.uk](mailto:y.fu@ed.ac.uk).
+
+### What We're Looking For in Contributions
+
+We are looking for contributions in several key areas to enhance the MoE-CAP project:
+
+1. **General Bug Fixes/Reports**: We welcome reports of any bugs found in the frontend interface or backend, as well as fixes for these issues.
+
+2. **Adding New Tasks (Benchmark Datasets)**: If you have ideas for new benchmark datasets that could be added, your contributions would be greatly appreciated.
+
+3. **Supporting New Inference Frameworks**: Expanding our project to support new inference frameworks is crucial for our growth. If you can contribute in this area, please reach out.
+
+4. **Testing More Models**: To make our leaderboard as comprehensive as possible, we need to test a wide range of models. Contributions in this area are highly valuable.
+
+Documentation is currently of lower priority, but if you have thoughts or suggestions, please feel free to raise them.
+
+Your contributions are crucial to the success and improvement of the MoE-CAP project. We look forward to collaborating with you.
+
+## RoadMap:
+- [ ] Support vLLM, TensorRT-LLM, MoE-Infinity and Huggingface Transformers
+- [ ] Implement auto-submission CI pipeline.
+- [ ] Implement CAP HTTP Server.
 
 ## Cite our paper
 ```
