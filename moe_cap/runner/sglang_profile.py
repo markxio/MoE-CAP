@@ -129,13 +129,7 @@ class SGLangMoEActivationAnalyzer:
 
     @sgl.function
     def run_sgl(s, question, max_new_tokens):
-        s += sgl.system_begin()
-        s += "You are an expert problem solver. Provide concise answers."
-        s += sgl.system_end()
-        s += sgl.user_begin()
         s += question
-        s += sgl.user_end()
-        s += sgl.assistant_begin()
         s += sgl.gen(
             "answer",
             max_tokens=max_new_tokens,
