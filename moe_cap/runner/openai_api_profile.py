@@ -602,7 +602,6 @@ def main():
     parser.add_argument("--config-file", type=str, help="Path to a JSON or YAML config file that contains CAPConfig fields")
     parser.add_argument("--api-url", type=str, required=True, help="OpenAI-compatible API endpoint URL (e.g., http://localhost:8000/v1/completions)")
     parser.add_argument("--output_dir", type=str, default="./output")
-    parser.add_argument("--precision", type=str, default="bfloat16")
     parser.add_argument("--batch-size", type=int, default=None, help="Number of requests per batch. If not set, all requests are sent at once.")
     args = parser.parse_args()
 
@@ -627,7 +626,6 @@ def main():
     # Merge CLI args over file config
     merged = dict(file_cfg or {})
     merged['model_id'] = args.model_name or merged.get('model_id')
-    merged['precision'] = args.precision or merged.get('precision')
     merged['dataset_names'] = args.datasets or merged.get('dataset_names')
 
     # Validate required fields

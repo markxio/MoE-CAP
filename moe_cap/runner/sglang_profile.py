@@ -286,7 +286,6 @@ def main():
     parser.add_argument("--config-file", type=str, help="Path to a JSON or YAML config file that contains CAPConfig fields")
     parser.add_argument("--port", type=int, default=30000, help="Port for the SGLang server")
     parser.add_argument("--output_dir", type=str, help="Output directory for metrics (default: ./output)")
-    parser.add_argument("--precision", type=str, default="bfloat16")
     args = parser.parse_args()
 
     # Load config file if provided (JSON or YAML). CLI args override file values.
@@ -310,7 +309,6 @@ def main():
     # Merge CLI args over file config
     merged = dict(file_cfg or {})
     merged['model_id'] = args.model_name or merged.get('model_id')
-    merged['precision'] = args.precision or merged.get('precision')
     merged['dataset_names'] = args.datasets or merged.get('dataset_names')
 
     # Validate required fields
