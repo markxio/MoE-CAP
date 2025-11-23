@@ -251,8 +251,13 @@ def apply_vllm_monkey_patching():
                                     num_physical_experts = num_logical_experts
                                     num_local_physical_experts = num_logical_experts // ep_size if ep_size > 1 else num_logical_experts
                                 else:
-                                    num_experts = getattr(hf_config, 'num_experts', 60)
-                                    num_layers = 24
+                                    # Try to detect from hf_config with support for DeepSeek (n_routed_experts)
+                                    num_experts = getattr(hf_config, 'num_experts', None)
+                                    if num_experts is None:
+                                        num_experts = getattr(hf_config, 'n_routed_experts', 60)
+                                        
+                                    num_layers = getattr(hf_config, 'num_hidden_layers', getattr(hf_config, 'n_layer', 24))
+                                    
                                     num_physical_experts = num_experts
                                     num_local_physical_experts = num_experts
                                     ep_size = 1
@@ -467,8 +472,13 @@ def apply_vllm_monkey_patching():
                         num_physical_experts = num_logical_experts
                         num_local_physical_experts = num_logical_experts // ep_size if ep_size > 1 else num_logical_experts
                     else:
-                        num_experts = getattr(hf_config, 'num_experts', 60)
-                        num_layers = 24
+                        # Try to detect from hf_config with support for DeepSeek (n_routed_experts)
+                        num_experts = getattr(hf_config, 'num_experts', None)
+                        if num_experts is None:
+                            num_experts = getattr(hf_config, 'n_routed_experts', 60)
+                            
+                        num_layers = getattr(hf_config, 'num_hidden_layers', getattr(hf_config, 'n_layer', 24))
+                        
                         num_physical_experts = num_experts
                         num_local_physical_experts = num_experts
                         ep_size = 1
