@@ -290,8 +290,8 @@ def apply_vllm_monkey_patching():
                             
                             # Auto-configure if flag is set but no mode specified
                             if auto_start_enabled and recording_mode is None:
-                                recording_mode = "stat"  # Default to stat mode like sglang.py
-                                enable_metrics = True  # Enable metrics like sglang.py
+                                recording_mode = "per_pass"  # Default to per_pass mode (CUDA graph compatible)
+                                enable_metrics = True
                                 if rank == 0:
                                     print(f"[ExpertDist-Worker PID {os.getpid()}] Auto-starting expert distribution recording (mode={recording_mode})", flush=True)
 
@@ -451,8 +451,8 @@ def apply_vllm_monkey_patching():
                         }
                     recording_mode = mode_lower
                 else:
-                    # Default to "stat" if None
-                    recording_mode = "stat"
+                    # Default to "per_pass" if None (CUDA graph compatible)
+                    recording_mode = "per_pass"
 
                 # Call the GPUModelRunner method directly to avoid delegation issues
                 from expert_distribution_recorder import ExpertDistributionRecorder, set_global_expert_distribution_recorder
@@ -615,8 +615,8 @@ def apply_vllm_monkey_patching():
                     auto_start_enabled = os.path.exists(EXPERT_DISTRIBUTION_AUTO_START_FLAG_FILE)
                     
                     if auto_start_enabled and hasattr(self, 'model_runner') and self.model_runner is not None:
-                        # Auto-configure with stat mode (like sglang.py)
-                        self.configure_expert_distribution_recorder(recording_mode="stat", enable_metrics=True, buffer_size=-1)
+                        # Auto-configure with per_pass mode (CUDA graph compatible)
+                        self.configure_expert_distribution_recorder(recording_mode="per_pass", enable_metrics=True, buffer_size=-1)
                         # Auto-start recording
                         if hasattr(self.model_runner, 'expert_distribution_recorder') and self.model_runner.expert_distribution_recorder is not None:
                             self.model_runner.expert_distribution_recorder.start_record()
@@ -777,10 +777,10 @@ def apply_vllm_monkey_patching():
                              import torch
                              rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
                              
-                             # Default to stat mode (most common and graph-compatible)
-                             print(f"[ExpertDist-Worker PID {os.getpid()}] Auto-initializing default STAT recorder for CUDAGraph capture", flush=True)
+                             # Default to per_pass mode (most common and graph-compatible)
+                             print(f"[ExpertDist-Worker PID {os.getpid()}] Auto-initializing default PER_PASS recorder for CUDAGraph capture", flush=True)
                              recorder = ExpertDistributionRecorder.init_new(
-                                 recording_mode="stat",
+                                 recording_mode="per_pass",
                                  expert_location_metadata=metadata,
                                  rank=rank,
                                  device=str(self.device),
@@ -850,5 +850,76 @@ def apply_vllm_monkey_patching():
             SharedFusedMoE.select_experts._expert_dist_patched_main = True
     except Exception:
         pass
+
+    # Patch API server to add expert distribution endpoints
+    _patch_api_server()
+
+
+def _patch_api_server():
+    """Patch vLLM API server to add expert distribution endpoints."""
+    try:
+        print(f"[ExpertDist] Patching API server endpoints...", flush=True)
+        from vllm.entrypoints.openai import api_server
+        from fastapi import Response
+        from vllm.engine.async_llm_engine import AsyncLLMEngine
+        
+        # 1. Add methods to AsyncLLMEngine to support expert distribution RPCs
+        if not hasattr(AsyncLLMEngine, "start_expert_distribution_record"):
+            async def start_expert_distribution_record(self, mode="per_pass"):
+                # Calls configure_expert_distribution_recording on workers
+                # We use configure because it handles init + start
+                return await self.engine.model_executor.collective_rpc(
+                    "configure_expert_distribution_recording", 
+                    args=(mode, True, -1)
+                )
+            AsyncLLMEngine.start_expert_distribution_record = start_expert_distribution_record
+
+        if not hasattr(AsyncLLMEngine, "stop_expert_distribution_record"):
+            async def stop_expert_distribution_record(self):
+                return await self.engine.model_executor.collective_rpc("stop_expert_distribution_recording")
+            AsyncLLMEngine.stop_expert_distribution_record = stop_expert_distribution_record
+            
+        if not hasattr(AsyncLLMEngine, "dump_expert_distribution_record"):
+            async def dump_expert_distribution_record(self):
+                # We probably want to dump to a specific path derived from model path or config
+                # For now, let the worker decide the path or use default
+                return await self.engine.model_executor.collective_rpc("dump_expert_distribution_record")
+            AsyncLLMEngine.dump_expert_distribution_record = dump_expert_distribution_record
+
+        # 2. Register routes on the FastAPI app
+        # Note: api_server.app is the FastAPI instance
+        app = api_server.app
+        
+        # Define route handlers
+        @app.post("/start_expert_distribution")
+        async def api_start_record(mode: str = "per_pass"):
+            # Get engine from app state or global
+            engine = app.state.engine if hasattr(app.state, "engine") else api_server.engine
+            if engine and hasattr(engine, "start_expert_distribution_record"):
+                await engine.start_expert_distribution_record(mode)
+                return {"status": "started", "mode": mode}
+            return Response(content="Engine not ready or patching failed", status_code=500)
+
+        @app.post("/stop_expert_distribution")
+        async def api_stop_record():
+            engine = app.state.engine if hasattr(app.state, "engine") else api_server.engine
+            if engine and hasattr(engine, "stop_expert_distribution_record"):
+                await engine.stop_expert_distribution_record()
+                return {"status": "stopped"}
+            return Response(content="Engine not ready or patching failed", status_code=500)
+
+        @app.post("/dump_expert_distribution")
+        async def api_dump_record():
+            engine = app.state.engine if hasattr(app.state, "engine") else api_server.engine
+            if engine and hasattr(engine, "dump_expert_distribution_record"):
+                result = await engine.dump_expert_distribution_record()
+                return {"status": "dumped", "result": result}
+            return Response(content="Engine not ready or patching failed", status_code=500)
+            
+        print(f"[ExpertDist] API server endpoints patched successfully.", flush=True)
+            
+    except ImportError:
+        # API server modules might not be available in worker process
         pass
-        pass
+    except Exception as e:
+        print(f"[ExpertDist] Warning: Failed to patch API server: {e}", flush=True)

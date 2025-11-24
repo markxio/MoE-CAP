@@ -361,9 +361,9 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
             return
         self._recording = False
 
-        # Reset gatherer and accumulator
+        # Reset gatherer but preserve accumulator data for dumping
         self._gatherer.reset()
-        self._accumulator.reset()
+        # self._accumulator.reset()  # Don't reset accumulator on stop, so we can dump results
 
         # Clear global buffer
         set_global_expert_counts_buffer(None)
@@ -802,7 +802,7 @@ class _PerPassAccumulator(_Accumulator):
                 total_possible_experts = expert_counts.numel()
                 expert_utilization = total_activated / total_possible_experts if total_possible_experts > 0 else 0
 
-                self._pass_records.append({
+                record = {
                     "forward_pass_id": forward_pass_id,
                     "rank": self._rank,
                     "total_activated_experts": total_activated,
@@ -811,7 +811,13 @@ class _PerPassAccumulator(_Accumulator):
                     "expert_utilization": round(expert_utilization, 4),
                     "expert_counts": expert_counts.cpu().tolist(),
                     "timestamp": time.time()
-                })
+                }
+                
+                # Add forward_mode if available (injected by vLLM integration)
+                if "forward_mode" in single_pass_data:
+                    record["forward_mode"] = single_pass_data["forward_mode"]
+                
+                self._pass_records.append(record)
 
     def reset(self) -> None:
         """Reset accumulator."""
