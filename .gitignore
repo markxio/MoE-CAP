@@ -4,3 +4,4 @@ __pycache__/
 *.DS_Store
 data_testingspace/
 moe_cap_env/
+logs/
