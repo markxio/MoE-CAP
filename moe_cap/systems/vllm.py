@@ -88,7 +88,7 @@ _record_lock = threading.Lock()
 # Expert distribution recording state
 EXPERT_DISTRIBUTION_RECORDING_FLAG_FILE = os.path.join(tempfile.gettempdir(), "vllm_expert_distribution_recording.flag")
 EXPERT_DISTRIBUTION_AUTO_START_FLAG_FILE = os.path.join(tempfile.gettempdir(), "vllm_expert_distribution_auto_start.flag")
-EXPERT_DISTRIBUTION_OUTPUT_DIR = os.path.join(os.getcwd(), "outputs")
+EXPERT_DISTRIBUTION_OUTPUT_DIR = os.path.join(os.getcwd(), "logs/expert_distribution")
 _expert_record_lock = threading.Lock()
 _forward_pass_id_counter = 0
 _forward_pass_id_lock = threading.Lock()
@@ -174,7 +174,7 @@ class RecordingState:
 recording_state = RecordingState()
 
 # ============================================================================
-# Expert Distribution Recording State (similar to sglang.py)
+# Expert Distribution Recording State 
 # ============================================================================
 class ExpertDistributionRecordingState:
     """State for expert distribution recording with automatic JSONL output."""
@@ -184,19 +184,23 @@ class ExpertDistributionRecordingState:
         self.output_dir = EXPERT_DISTRIBUTION_OUTPUT_DIR
         self.model_path = None
         self.enabled = False
+        self.checked_auto_start = False
     
     def set_model_path(self, model_path: str):
         """Set the model path for output file naming."""
-        self.model_path = model_path.replace("/", "_")  # Sanitize path
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        sanitized_name = model_path.replace("/", "_")
+        self.model_path = f"{sanitized_name}_{timestamp}"
     
     def enable(self):
         """Enable automatic expert distribution recording."""
         self.enabled = True
-        self.expert_record_list = []
+        # self.expert_record_list = [] # Don't clear list on re-enable to preserve history
         # Create output directory
         os.makedirs(self.output_dir, exist_ok=True)
-        logger.info("Expert distribution automatic recording enabled")
-    
+        # logger.info("Expert distribution automatic recording enabled") # Reduce log spam on workers
+
     def disable(self):
         """Disable automatic expert distribution recording."""
         self.enabled = False
@@ -217,6 +221,7 @@ class ExpertDistributionRecordingState:
                 
                 with open(output_file, "a", encoding="utf-8") as f:
                     f.write(json.dumps(record) + "\n")
+                    f.flush()
     
     def get_records(self):
         """Get all recorded records."""
@@ -235,6 +240,17 @@ def execute_model_custom(
 ) -> Union[ModelRunnerOutput, AsyncModelRunnerOutput, IntermediateTensors]:
     """Custom execute_model with latency tracking."""
     
+    # Lazy initialization of recording state on workers
+    if not expert_distribution_recording_state.checked_auto_start:
+        if os.path.exists(EXPERT_DISTRIBUTION_AUTO_START_FLAG_FILE):
+            expert_distribution_recording_state.enable()
+        expert_distribution_recording_state.checked_auto_start = True
+    
+    # Ensure model path is set if recording is enabled
+    if expert_distribution_recording_state.enabled and not expert_distribution_recording_state.model_path:
+        if hasattr(self, 'model_config') and hasattr(self.model_config, 'model'):
+            expert_distribution_recording_state.set_model_path(self.model_config.model)
+
     with record_function_or_nullcontext("Preprocess"):
         with self.synchronize_input_prep():
             # Update persistent batch states.
@@ -423,65 +439,82 @@ def execute_model_custom(
     forward_mode = "decode" if uniform_decode else "prefill"
     sum_seq_len = num_input_tokens
     
-    # Track forward pass ID (similar to sglang.py)
+    # Track forward pass ID 
     global _forward_pass_id_counter
     with _forward_pass_id_lock:
         _forward_pass_id_counter += 1
         forward_pass_id = _forward_pass_id_counter
     
-    # Collect expert distribution data if available
+    # Collect expert distribution data (per_pass mode)
     expert_activation = 0
+    expert_utilization = 0
     try:
         # Try to get expert distribution data from the model runner
         if hasattr(self, 'expert_distribution_recorder') and self.expert_distribution_recorder is not None:
+            recorder = self.expert_distribution_recorder
             # Check if recording is active
-            if hasattr(self.expert_distribution_recorder, '_recording') and self.expert_distribution_recorder._recording:
-                # Get current expert counts from buffer (similar to sglang.py's logical_count calculation)
-                if hasattr(self.expert_distribution_recorder, 'get_expert_counts_buffer'):
-                    buffer = self.expert_distribution_recorder.get_expert_counts_buffer()
-                    if buffer is not None and buffer.numel() > 0:
-                        # Buffer shape for stat mode: [num_layers, num_experts] (accumulated across forward passes)
-                        # Calculate expert_activation similar to sglang.py:
-                        # 1. activated_experts = (buffer > 0).float() -> [num_layers, num_experts]
-                        # 2. activated_per_layer = activated_experts.sum(dim=1) -> [num_layers]
-                        # 3. avg_activated_per_step = activated_per_layer.mean() -> scalar
-                        if buffer.ndim == 2:
-                            # [num_layers, num_experts] - this is the stat mode buffer shape
-                            activated_experts = (buffer > 0).float()  # [num_layers, num_experts]
-                            # Sum across experts dimension to get number of activated experts per layer
-                            activated_per_layer = activated_experts.sum(dim=1)  # [num_layers]
-                            # Average across layers to get one number per step (like sglang.py)
-                            avg_activated_per_step = activated_per_layer.mean().item()
-                            expert_activation = avg_activated_per_step
-                        elif buffer.ndim == 3:
-                            # [num_forwards, num_layers, num_experts] - per-pass mode
-                            # Get the latest forward pass
-                            latest_counts = buffer[-1]  # [num_layers, num_experts]
-                            activated_experts = (latest_counts > 0).float()
-                            activated_per_layer = activated_experts.sum(dim=1)
-                            avg_activated_per_step = activated_per_layer.mean().item()
-                            expert_activation = avg_activated_per_step
-                        else:
-                            # Fallback: count unique active experts
-                            active_experts = (buffer > 0).any(dim=0) if buffer.ndim > 1 else (buffer > 0)
-                            expert_activation = active_experts.sum().item() if active_experts.ndim > 0 else 0
+            if hasattr(recorder, '_recording') and recorder._recording:
+                # CRITICAL: Use per_pass collection logic (collect -> reset -> append)
+                # This is what allows it to work with CUDAGraph (where forward hooks don't run CPU code)
+                
+                # 1. Collect data from gatherer (syncs if needed)
+                if hasattr(recorder, '_gatherer'):
+                    collected_data = recorder._gatherer.collect()
+                    # Inject forward_mode into collected data so it's available for dump/accumulation
+                    collected_data['forward_mode'] = forward_mode
+                    recorder._gatherer.reset()
+                    
+                    # 2. Append to accumulator with current pass ID
+                    if hasattr(recorder, '_accumulator'):
+                        recorder._accumulator.append(forward_pass_id, collected_data)
+                    
+                    # 3. Calculate metric for logging from the collected data
+                    # collected_data['expert_count'] is [num_layers, num_experts]
+                    # Note: The key is 'expert_count' (singular) in the recorder implementation
+                    if 'expert_count' in collected_data:
+                        counts = collected_data['expert_count']
+                        if counts is not None:
+                            # Average activated experts per layer
+                            # (counts > 0).float() -> [num_layers, num_experts]
+                            # .sum(dim=1) -> [num_layers]
+                            # .mean() -> scalar
+                            active = (counts > 0).float().sum(dim=1).mean().item()
+                            expert_activation = active
+                    
+                    # Calculate utilization
+                    if expert_activation > 0 and hasattr(recorder, '_expert_location_metadata'):
+                         num_experts = recorder._expert_location_metadata.num_logical_experts
+                         if num_experts > 0:
+                              expert_utilization = expert_activation / num_experts
+
     except Exception as e:
         # Don't fail if expert recording is not available or fails
+        print(f"[ExpertDist-Error] Failed to calculate/record metrics: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
         logger.debug(f"Could not collect expert distribution data: {e}")
     
     # Record batch statistics if recording is enabled (file-based check for multiprocessing)
     if recording_state.is_recording():
+        # Use attn_metadata for seq_lens_sum if available (gives full context length)
+        if hasattr(attn_metadata, "seq_lens"):
+             if isinstance(attn_metadata.seq_lens, torch.Tensor):
+                  sum_seq_len = attn_metadata.seq_lens.sum().item()
+             elif isinstance(attn_metadata.seq_lens, list):
+                  sum_seq_len = sum(attn_metadata.seq_lens)
+        
         rec_dict = {
             "batch_size": batch_size,
             "latency": latency,
             "seq_lens_sum": sum_seq_len,
             "forward_mode": forward_mode,
-            "expert_activation": expert_activation
+            "expert_activation": expert_activation,
+            "expert_utilization": round(expert_utilization, 4)
         }
         recording_state.add_record(rec_dict)
     
-    # Automatic expert distribution recording (sglang.py style)
-    # Only record on rank 0 to avoid duplicates (similar to sglang.py's tp_rank == 0 check)
+    # Automatic expert distribution recording 
+    # Only record on rank 0 to avoid duplicates 
     if expert_distribution_recording_state.enabled:
         try:
             from vllm.distributed.parallel_state import get_tp_group
@@ -489,13 +522,21 @@ def execute_model_custom(
             tp_rank = tp_group.rank if tp_group is not None else 0
             
             if tp_rank == 0:  # Only record on rank 0 (like sglang.py)
+                # Recalculate seq_lens_sum for this record as well
+                if hasattr(attn_metadata, "seq_lens"):
+                     if isinstance(attn_metadata.seq_lens, torch.Tensor):
+                          sum_seq_len = attn_metadata.seq_lens.sum().item()
+                     elif isinstance(attn_metadata.seq_lens, list):
+                          sum_seq_len = sum(attn_metadata.seq_lens)
+                
                 record_dict = {
                     "forward_pass_id": forward_pass_id,
                     "batch_size": batch_size,
                     "latency": latency,
                     "seq_lens_sum": sum_seq_len,
                     "forward_mode": forward_mode,
-                    "expert_activation": expert_activation
+                    "expert_activation": expert_activation,
+                    "expert_utilization": round(expert_utilization, 4)
                 }
                 expert_distribution_recording_state.add_record(record_dict)
                 logger.info(f"Forward pass {forward_pass_id} completed with latency {latency:.4f}s, expert activation {expert_activation:.2f}")
@@ -1082,12 +1123,13 @@ def add_custom_endpoints(app):
             )
     
     @app.post("/dump_expert_distribution")
-    async def dump_expert_distribution(request: Request, summary_only: bool = True):
+    async def dump_expert_distribution(request: Request, summary_only: bool = True, pretty: bool = True):
         """Dump recorded expert distribution data.
         
         Args:
             summary_only: If True (default), return summary statistics instead of raw arrays.
                          If False, return full detailed data (can be very large).
+            pretty: If True (default), return indented JSON for readability.
         
         Returns:
             Summary statistics similar to sglang.py format, or full data if summary_only=False
@@ -1106,6 +1148,8 @@ def add_custom_endpoints(app):
             if not isinstance(all_data, list):
                 all_data = [all_data] if all_data else []
             
+            response_data = None
+            
             if summary_only:
                 # Return clean summary similar to sglang.py
                 summary = {
@@ -1114,9 +1158,56 @@ def add_custom_endpoints(app):
                     "summary": {}
                 }
                 
-                # Get per-forward-pass records from expert_distribution_recording_state (if available)
-                if expert_distribution_recording_state.enabled:
-                    records = expert_distribution_recording_state.get_records()
+                # Get per-forward-pass records from worker data (Rank 0)
+                # We use worker data because expert_distribution_recording_state is process-local and empty on API server
+                records = []
+                for worker_data in all_data:
+                    if isinstance(worker_data, dict) and worker_data.get("rank") == 0 and "records" in worker_data:
+                         records = worker_data["records"]
+                         break
+                
+                if records:
+                    # Calculate prefill/decode averages
+                    prefill_activations = []
+                    decode_activations = []
+                    
+                    for r in records:
+                        # expert_activation calculation repeats logic from execute_model_custom
+                        # but here we might have pre-calculated values if the recorder stored them?
+                        # The recorder stores 'expert_count' tensor/array.
+                        # We need to re-calculate 'active' from the array if it's not stored.
+                        # Wait, the recorder stores RAW counts.
+                        
+                        # Helper to calculate activation from record
+                        activation = 0
+                        if "expert_count" in r:
+                             counts = r["expert_count"]
+                             # counts is a list (JSON) or numpy array
+                             import numpy as np
+                             c = np.array(counts)
+                             if c.size > 0:
+                                 # (counts > 0).sum(axis=1).mean()
+                                 activation = (c > 0).sum(axis=1).mean()
+                        elif "expert_counts" in r:
+                             counts = r["expert_counts"]
+                             import numpy as np
+                             c = np.array(counts)
+                             if c.size > 0:
+                                 activation = (c > 0).sum(axis=1).mean()
+                        
+                        mode = r.get("forward_mode", "unknown")
+                        if mode == "prefill":
+                             prefill_activations.append(activation)
+                        elif mode == "decode":
+                             decode_activations.append(activation)
+
+                    if prefill_activations:
+                        summary["summary"]["average_expert_activation_prefill"] = sum(prefill_activations) / len(prefill_activations)
+                    
+                    if decode_activations:
+                        summary["summary"]["average_expert_activation_decode"] = sum(decode_activations) / len(decode_activations)
+
+
                     # Clean sample records - remove large arrays to keep output compact
                     sample_records = []
                     for record in (records[:5] if len(records) > 5 else records):
@@ -1126,10 +1217,12 @@ def add_custom_endpoints(app):
                         clean_record.pop("activated_per_layer", None)  # per_pass mode: 1D array
                         clean_record.pop("topk_ids", None)  # per_token mode: 3D array [num_layers, num_tokens, topk]
                         sample_records.append(clean_record)
+                    
+                    # Simplify output: don't show sample records here, just count and file info
                     summary["summary"]["forward_pass_records"] = {
                         "count": len(records),
-                        "sample": sample_records,
-                        "note": f"Full records written to JSONL file. Showing {min(5, len(records))} of {len(records)} records."
+                        # "sample": sample_records, # Removed to reduce verbosity
+                        "note": "Detailed records are in the JSONL file."
                     }
                 
                 # Extract summary from worker data
@@ -1197,7 +1290,7 @@ def add_custom_endpoints(app):
                     summary["summary"]["jsonl_file"] = output_file
                     summary["summary"]["note"] = "Detailed per-forward-pass records are written to JSONL file automatically."
                 
-                return JSONResponse(content=summary)
+                response_data = summary
             else:
                 # Return full data (original behavior)
                 def make_serializable(obj):
@@ -1217,17 +1310,30 @@ def add_custom_endpoints(app):
                         return str(obj)
                 
                 try:
-                    all_data = make_serializable(all_data)
+                    response_data = {
+                        "status": "success",
+                        "data": make_serializable(all_data),
+                        "num_workers": len(all_data),
+                        "note": "Full detailed data returned. Use summary_only=true for cleaner output."
+                    }
                 except Exception as e:
                     logger.warning(f"Could not fully serialize data: {e}, converting to string")
-                    all_data = str(all_data)
-                
-                return JSONResponse(content={
-                    "status": "success",
-                    "data": all_data,
-                    "num_workers": len(all_data),
-                    "note": "Full detailed data returned. Use summary_only=true for cleaner output."
-                })
+                    response_data = {
+                        "status": "success",
+                        "data": str(all_data),
+                        "num_workers": len(all_data),
+                        "error": str(e)
+                    }
+
+            if pretty:
+                from fastapi.responses import Response
+                return Response(
+                    content=json.dumps(response_data, indent=2, default=str),
+                    media_type="application/json"
+                )
+            else:
+                return JSONResponse(content=response_data)
+
         except Exception as e:
             import traceback
             return JSONResponse(
