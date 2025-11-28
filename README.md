@@ -6,6 +6,9 @@
 
 MoE-CAP is a benchmarking method designed to evaluate sparse MoE systems by integrating Cost, Accuracy, and Performance across these three dimensions.
 
+# Dashboard
+Visit our [HuggingFace Space](https://huggingface.co/spaces/auto-cap/MoE-CAP-Dashboard) to access the results dashboard and create your own CAP Radar Plots.
+
 ## News
 - MoE-CAP has been accepted to NeurIPS 2025 Dataset and Benchmark Track 🎉 See you in San Diego, US.
 
@@ -14,7 +17,7 @@ Python: >= 3.9
 
 ## Installation
 ```bash
-git clone https://github.com/sparse-generative-ai/MoE-CAP.git
+git clone https://github.com/Auto-CAP/MoE-CAP.git
 cd MoE-CAP
 pip install -e .
 ```
@@ -49,6 +52,7 @@ python -m moe_cap.systems.vllm \
         --host 0.0.0.0 \
         --tensor-parallel-size 8 \
         --reasoning-parser deepseek_r1 \
+        --enable-expert-distribution-metrics \
         --max-num-batched-tokens 131072 # Set max-num-batched-tokens large referring to vLLM tuning guide.
                                         # V1's mixed prefill-decode batching makes separate profiling difficult.
 ```
