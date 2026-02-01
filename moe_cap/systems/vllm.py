@@ -3,33 +3,23 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """
-Launch vLLM server using: python -m vllm.launch_server [options]
+Launch vLLM server using: python -m moe_cap.systems.vllm [options]
 
 This module provides a simple way to start the vLLM OpenAI-compatible API server
-without using the CLI command. It wraps the serve functionality from vllm.entrypoints.openai.
+with MoE-CAP expert distribution recording capabilities.
 """
 
 import sys
 import os
+import signal
 import uvloop
 import json
-import textwrap
-from collections import defaultdict
+import argparse
 from typing import Any, Optional, Union
 import regex as re
 import yaml
 import torch
 import time
-
-from argparse import (
-    Action,
-    ArgumentDefaultsHelpFormatter,
-    ArgumentParser,
-    ArgumentTypeError,
-    Namespace,
-    RawDescriptionHelpFormatter,
-    _ArgumentGroup,
-)
 
 # ============================================================================
 # CRITICAL: Import and patch GPUModelRunner BEFORE any other vLLM imports
@@ -587,361 +577,32 @@ assert GPUModelRunner.execute_model.__name__ == "execute_model_custom", \
 # ============================================================================
 # Now import the rest of vLLM components
 # ============================================================================
-from vllm.entrypoints.openai.api_server import run_server
+import vllm
+import vllm.envs as envs
+from vllm.entrypoints.openai.api_server import (
+    run_server,
+    run_server_worker,
+    setup_server,
+)
 from vllm.entrypoints.openai.cli_args import make_arg_parser, validate_parsed_serve_args
+from vllm.usage.usage_lib import UsageContext
+from vllm.utils.argparse_utils import FlexibleArgumentParser
+from vllm.utils.network_utils import get_tcp_uri
+from vllm.utils.system_utils import decorate_logs, set_process_title
+from vllm.v1.engine.core import EngineCoreProc
+from vllm.v1.engine.utils import CoreEngineProcManager, launch_core_engines
+from vllm.v1.executor import Executor
+from vllm.v1.executor.multiproc_executor import MultiprocExecutor
+from vllm.v1.metrics.prometheus import setup_multiprocess_prometheus
+from vllm.v1.utils import APIServerProcessManager, wait_for_completion_or_failure
 
+DESCRIPTION = """Launch a local OpenAI-compatible API server to serve LLM
+completions via HTTP with MoE-CAP expert distribution recording.
 
-# ============================================================================
-# Argument parser classes (unchanged from original)
-# ============================================================================
-class SortedHelpFormatter(ArgumentDefaultsHelpFormatter, RawDescriptionHelpFormatter):
-    """SortedHelpFormatter that sorts arguments by their option strings."""
-
-    def _split_lines(self, text, width):
-        single_newline = re.compile(r"(?<!\n)\n(?!\n)\s*")
-        multiple_newlines = re.compile(r"\n{2,}\s*")
-        text = single_newline.sub(" ", text)
-        lines = re.split(multiple_newlines, text)
-        return sum([textwrap.wrap(line, width) for line in lines], [])
-
-    def add_arguments(self, actions):
-        actions = sorted(actions, key=lambda x: x.option_strings)
-        super().add_arguments(actions)
-
-
-class FlexibleArgumentParser(ArgumentParser):
-    """ArgumentParser that allows both underscore and dash in names."""
-
-    _deprecated: set[Action] = set()
-    _json_tip: str = (
-        "When passing JSON CLI arguments, the following sets of arguments "
-        "are equivalent:\n"
-        '   --json-arg \'{"key1": "value1", "key2": {"key3": "value2"}}\'\n'
-        "   --json-arg.key1 value1 --json-arg.key2.key3 value2\n\n"
-        "Additionally, list elements can be passed individually using +:\n"
-        '   --json-arg \'{"key4": ["value3", "value4", "value5"]}\'\n'
-        "   --json-arg.key4+ value3 --json-arg.key4+='value4,value5'\n\n"
-    )
-    _search_keyword: str | None = None
-
-    def __init__(self, *args, **kwargs):
-        if "formatter_class" not in kwargs:
-            kwargs["formatter_class"] = SortedHelpFormatter
-        self.add_json_tip = kwargs.pop("add_json_tip", True)
-        super().__init__(*args, **kwargs)
-
-    if sys.version_info < (3, 13):
-        def parse_known_args(self, args=None, namespace=None):
-            if args is not None and "--disable-log-requests" in args:
-                logger.warning_once(
-                    "argument '--disable-log-requests' is deprecated and "
-                    "replaced with '--enable-log-requests'. This will be "
-                    "removed in v0.12.0."
-                )
-            namespace, args = super().parse_known_args(args, namespace)
-            for action in FlexibleArgumentParser._deprecated:
-                if (
-                    hasattr(namespace, dest := action.dest)
-                    and getattr(namespace, dest) != action.default
-                ):
-                    logger.warning_once("argument '%s' is deprecated", dest)
-            return namespace, args
-
-        def add_argument(self, *args, **kwargs):
-            deprecated = kwargs.pop("deprecated", False)
-            action = super().add_argument(*args, **kwargs)
-            if deprecated:
-                FlexibleArgumentParser._deprecated.add(action)
-            return action
-
-        class _FlexibleArgumentGroup(_ArgumentGroup):
-            def add_argument(self, *args, **kwargs):
-                deprecated = kwargs.pop("deprecated", False)
-                action = super().add_argument(*args, **kwargs)
-                if deprecated:
-                    FlexibleArgumentParser._deprecated.add(action)
-                return action
-
-        def add_argument_group(self, *args, **kwargs):
-            group = self._FlexibleArgumentGroup(self, *args, **kwargs)
-            self._action_groups.append(group)
-            return group
-
-    def format_help(self):
-        if self._subparsers is not None:
-            return super().format_help()
-
-        formatter = self._get_formatter()
-
-        if (search_keyword := self._search_keyword) is not None:
-            search_keyword = search_keyword.lower().replace("_", "-")
-            if search_keyword == "all":
-                self.epilog = self._json_tip
-                return super().format_help()
-
-            for group in self._action_groups:
-                if group.title and group.title.lower() == search_keyword:
-                    formatter.start_section(group.title)
-                    formatter.add_text(group.description)
-                    formatter.add_arguments(group._group_actions)
-                    formatter.end_section()
-                    formatter.add_text(self._json_tip)
-                    return formatter.format_help()
-
-            matched_actions = []
-            for group in self._action_groups:
-                for action in group._group_actions:
-                    if any(
-                        search_keyword in opt.lower() for opt in action.option_strings
-                    ):
-                        matched_actions.append(action)
-            if matched_actions:
-                formatter.start_section(f"Arguments matching '{search_keyword}'")
-                formatter.add_arguments(matched_actions)
-                formatter.end_section()
-                formatter.add_text(self._json_tip)
-                return formatter.format_help()
-
-            formatter.add_text(
-                f"No group or arguments matching '{search_keyword}'.\n"
-                "Use '--help' to see available groups or "
-                "'--help=all' to see all available parameters."
-            )
-            return formatter.format_help()
-
-        formatter.add_usage(self.usage, self._actions, self._mutually_exclusive_groups)
-        formatter.add_text(self.description)
-
-        formatter.start_section("Config Groups")
-        config_groups = ""
-        for group in self._action_groups:
-            if not group._group_actions:
-                continue
-            title = group.title
-            description = group.description or ""
-            config_groups += f"{title: <24}{description}\n"
-        formatter.add_text(config_groups)
-        formatter.end_section()
-
-        formatter.add_text(self.epilog)
-        return formatter.format_help()
-
-    def parse_args(self, args: list[str] | None = None, namespace: Namespace | None = None):
-        if args is None:
-            args = sys.argv[1:]
-
-        if args and args[0] == "serve":
-            try:
-                model_idx = next(
-                    i
-                    for i, arg in enumerate(args)
-                    if arg == "--model" or arg.startswith("--model=")
-                )
-                logger.warning(
-                    "With `vllm serve`, you should provide the model as a "
-                    "positional argument or in a config file instead of via "
-                    "the `--model` option. "
-                    "The `--model` option will be removed in v0.13."
-                )
-
-                if args[model_idx] == "--model":
-                    model_tag = args[model_idx + 1]
-                    rest_start_idx = model_idx + 2
-                else:
-                    model_tag = args[model_idx].removeprefix("--model=")
-                    rest_start_idx = model_idx + 1
-
-                args = [
-                    "serve",
-                    model_tag,
-                    *args[1:model_idx],
-                    *args[rest_start_idx:],
-                ]
-            except StopIteration:
-                pass
-
-        if "--config" in args:
-            args = self._pull_args_from_config(args)
-
-        def repl(match: re.Match) -> str:
-            return match.group(0).replace("_", "-")
-
-        pattern = re.compile(r"(?<=--)[^\.]*")
-
-        processed_args = list[str]()
-        for i, arg in enumerate(args):
-            if arg.startswith("--help="):
-                FlexibleArgumentParser._search_keyword = arg.split("=", 1)[-1].lower()
-                processed_args.append("--help")
-            elif arg.startswith("--"):
-                if "=" in arg:
-                    key, value = arg.split("=", 1)
-                    key = pattern.sub(repl, key, count=1)
-                    processed_args.append(f"{key}={value}")
-                else:
-                    key = pattern.sub(repl, arg, count=1)
-                    processed_args.append(key)
-            elif arg.startswith("-O") and arg != "-O" and arg[2] != ".":
-                mode = arg[3:] if arg[2] == "=" else arg[2:]
-                processed_args.append(f"-O.mode={mode}")
-            elif (
-                arg == "-O"
-                and i + 1 < len(args)
-                and args[i + 1] in {"0", "1", "2", "3"}
-            ):
-                processed_args.append("-O.mode")
-            else:
-                processed_args.append(arg)
-
-        def create_nested_dict(keys: list[str], value: str) -> dict[str, Any]:
-            nested_dict: Any = value
-            for key in reversed(keys):
-                nested_dict = {key: nested_dict}
-            return nested_dict
-
-        def recursive_dict_update(
-            original: dict[str, Any],
-            update: dict[str, Any],
-        ) -> set[str]:
-            duplicates = set[str]()
-            for k, v in update.items():
-                if isinstance(v, dict) and isinstance(original.get(k), dict):
-                    nested_duplicates = recursive_dict_update(original[k], v)
-                    duplicates |= {f"{k}.{d}" for d in nested_duplicates}
-                elif isinstance(v, list) and isinstance(original.get(k), list):
-                    original[k] += v
-                else:
-                    if k in original:
-                        duplicates.add(k)
-                    original[k] = v
-            return duplicates
-
-        delete = set[int]()
-        dict_args = defaultdict[str, dict[str, Any]](dict)
-        duplicates = set[str]()
-        for i, processed_arg in enumerate(processed_args):
-            if i in delete:
-                continue
-
-            if processed_arg.startswith("-") and "." in processed_arg:
-                if "=" in processed_arg:
-                    processed_arg, value_str = processed_arg.split("=", 1)
-                    if "." not in processed_arg:
-                        continue
-                else:
-                    value_str = processed_args[i + 1]
-                    delete.add(i + 1)
-
-                if processed_arg.endswith("+"):
-                    processed_arg = processed_arg[:-1]
-                    value_str = json.dumps(list(value_str.split(",")))
-
-                key, *keys = processed_arg.split(".")
-                try:
-                    value = json.loads(value_str)
-                except json.decoder.JSONDecodeError:
-                    value = value_str
-
-                arg_dict = create_nested_dict(keys, value)
-                arg_duplicates = recursive_dict_update(dict_args[key], arg_dict)
-                duplicates |= {f"{key}.{d}" for d in arg_duplicates}
-                delete.add(i)
-        
-        processed_args = [a for i, a in enumerate(processed_args) if i not in delete]
-        if duplicates:
-            logger.warning("Found duplicate keys %s", ", ".join(duplicates))
-
-        for dict_arg, dict_value in dict_args.items():
-            processed_args.append(dict_arg)
-            processed_args.append(json.dumps(dict_value))
-
-        return super().parse_args(processed_args, namespace)
-
-    def check_port(self, value):
-        try:
-            value = int(value)
-        except ValueError:
-            msg = "Port must be an integer"
-            raise ArgumentTypeError(msg) from None
-
-        if not (1024 <= value <= 65535):
-            raise ArgumentTypeError("Port must be between 1024 and 65535")
-
-        return value
-
-    def _pull_args_from_config(self, args: list[str]) -> list[str]:
-        assert args.count("--config") <= 1, "More than one config file specified!"
-
-        index = args.index("--config")
-        if index == len(args) - 1:
-            raise ValueError(
-                "No config file specified! "
-                "Please check your command-line arguments."
-            )
-
-        file_path = args[index + 1]
-        config_args = self.load_config_file(file_path)
-
-        if args[0].startswith("-"):
-            args = config_args + args[0:index] + args[index + 2 :]
-        elif args[0] == "serve":
-            model_in_cli = len(args) > 1 and not args[1].startswith("-")
-            model_in_config = any(arg == "--model" for arg in config_args)
-
-            if not model_in_cli and not model_in_config:
-                raise ValueError(
-                    "No model specified! Please specify model either "
-                    "as a positional argument or in a config file."
-                )
-
-            if model_in_cli:
-                args = (
-                    [args[0]]
-                    + [args[1]]
-                    + config_args
-                    + args[2:index]
-                    + args[index + 2 :]
-                )
-            else:
-                args = [args[0]] + config_args + args[1:index] + args[index + 2 :]
-        else:
-            args = [args[0]] + config_args + args[1:index] + args[index + 2 :]
-
-        return args
-
-    def load_config_file(self, file_path: str) -> list[str]:
-        extension: str = file_path.split(".")[-1]
-        if extension not in ("yaml", "yml"):
-            raise ValueError(
-                f"Config file must be of a yaml/yml type. {extension} supplied"
-            )
-
-        processed_args: list[str] = []
-        config: dict[str, int | str] = {}
-        try:
-            with open(file_path) as config_file:
-                config = yaml.safe_load(config_file)
-        except Exception as ex:
-            logger.error(
-                "Unable to read the config file at %s. Check path correctness",
-                file_path,
-            )
-            raise ex
-
-        for key, value in config.items():
-            if isinstance(value, bool):
-                if value:
-                    processed_args.append("--" + key)
-            elif isinstance(value, list):
-                if value:
-                    processed_args.append("--" + key)
-                    for item in value:
-                        processed_args.append(str(item))
-            else:
-                processed_args.append("--" + key)
-                processed_args.append(str(value))
-
-        return processed_args
+Search by using: `--help=<ConfigGroup>` to explore options by section (e.g.,
+--help=ModelConfig, --help=Frontend)
+  Use `--help=all` to show all available flags at once.
+"""
 
 
 # ============================================================================
@@ -1450,13 +1111,187 @@ def add_custom_endpoints(app):
             )
 
 
+# ============================================================================
+# Run functions (matching vLLM's serve.py structure)
+# ============================================================================
+
+def run_headless(args: argparse.Namespace):
+    """Run in headless mode (no API servers)."""
+    if args.api_server_count > 1:
+        raise ValueError("api_server_count can't be set in headless mode")
+
+    # Create the EngineConfig.
+    engine_args = vllm.AsyncEngineArgs.from_cli_args(args)
+    usage_context = UsageContext.OPENAI_API_SERVER
+    vllm_config = engine_args.create_engine_config(
+        usage_context=usage_context, headless=True
+    )
+
+    if engine_args.data_parallel_hybrid_lb:
+        raise ValueError("data_parallel_hybrid_lb is not applicable in headless mode")
+
+    parallel_config = vllm_config.parallel_config
+    local_engine_count = parallel_config.data_parallel_size_local
+
+    if local_engine_count <= 0:
+        raise ValueError("data_parallel_size_local must be > 0 in headless mode")
+
+    shutdown_requested = False
+
+    # Catch SIGTERM and SIGINT to allow graceful shutdown.
+    def signal_handler(signum, frame):
+        nonlocal shutdown_requested
+        logger.debug("Received %d signal.", signum)
+        if not shutdown_requested:
+            shutdown_requested = True
+            raise SystemExit
+
+    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)
+
+    if parallel_config.node_rank_within_dp > 0:
+        from vllm.version import __version__ as VLLM_VERSION
+
+        # Run headless workers (for multi-node PP/TP).
+        host = parallel_config.master_addr
+        head_node_address = f"{host}:{parallel_config.master_port}"
+        logger.info(
+            "Launching vLLM (v%s) headless multiproc executor, "
+            "with head node address %s for torch.distributed process group.",
+            VLLM_VERSION,
+            head_node_address,
+        )
+
+        executor = MultiprocExecutor(vllm_config, monitor_workers=False)
+        executor.start_worker_monitor(inline=True)
+        return
+
+    host = parallel_config.data_parallel_master_ip
+    port = parallel_config.data_parallel_rpc_port
+    handshake_address = get_tcp_uri(host, port)
+
+    logger.info(
+        "Launching %d data parallel engine(s) in headless mode, "
+        "with head node address %s.",
+        local_engine_count,
+        handshake_address,
+    )
+
+    # Create the engines.
+    engine_manager = CoreEngineProcManager(
+        target_fn=EngineCoreProc.run_engine_core,
+        local_engine_count=local_engine_count,
+        start_index=vllm_config.parallel_config.data_parallel_rank,
+        local_start_index=0,
+        vllm_config=vllm_config,
+        local_client=False,
+        handshake_address=handshake_address,
+        executor_class=Executor.get_class(vllm_config),
+        log_stats=not engine_args.disable_log_stats,
+    )
+
+    try:
+        engine_manager.join_first()
+    finally:
+        logger.info("Shutting down.")
+        engine_manager.close()
+
+
+def run_multi_api_server(args: argparse.Namespace):
+    """Run with multiple API servers."""
+    assert not args.headless
+    num_api_servers: int = args.api_server_count
+    assert num_api_servers > 0
+
+    if num_api_servers > 1:
+        setup_multiprocess_prometheus()
+
+    listen_address, sock = setup_server(args)
+
+    engine_args = vllm.AsyncEngineArgs.from_cli_args(args)
+    engine_args._api_process_count = num_api_servers
+    engine_args._api_process_rank = -1
+
+    usage_context = UsageContext.OPENAI_API_SERVER
+    vllm_config = engine_args.create_engine_config(usage_context=usage_context)
+
+    if num_api_servers > 1 and envs.VLLM_ALLOW_RUNTIME_LORA_UPDATING:
+        raise ValueError(
+            "VLLM_ALLOW_RUNTIME_LORA_UPDATING cannot be used with api_server_count > 1"
+        )
+
+    executor_class = Executor.get_class(vllm_config)
+    log_stats = not engine_args.disable_log_stats
+
+    parallel_config = vllm_config.parallel_config
+    dp_rank = parallel_config.data_parallel_rank
+    assert parallel_config.local_engines_only or dp_rank == 0
+
+    api_server_manager: APIServerProcessManager | None = None
+
+    with launch_core_engines(
+        vllm_config, executor_class, log_stats, num_api_servers
+    ) as (local_engine_manager, coordinator, addresses):
+        # Construct common args for the APIServerProcessManager up-front.
+        api_server_manager_kwargs = dict(
+            target_server_fn=run_api_server_worker_proc,
+            listen_address=listen_address,
+            sock=sock,
+            args=args,
+            num_servers=num_api_servers,
+            input_addresses=addresses.inputs,
+            output_addresses=addresses.outputs,
+            stats_update_address=coordinator.get_stats_publish_address()
+            if coordinator
+            else None,
+        )
+
+        # For dp ranks > 0 in external/hybrid DP LB modes, we must delay the
+        # start of the API servers until the local engine is started
+        # (after the launcher context manager exits),
+        # since we get the front-end stats update address from the coordinator
+        # via the handshake with the local engine.
+        if dp_rank == 0 or not parallel_config.local_engines_only:
+            # Start API servers using the manager.
+            api_server_manager = APIServerProcessManager(**api_server_manager_kwargs)
+
+    # Start API servers now if they weren't already started.
+    if api_server_manager is None:
+        api_server_manager_kwargs["stats_update_address"] = (
+            addresses.frontend_stats_publish_address
+        )
+        api_server_manager = APIServerProcessManager(**api_server_manager_kwargs)
+
+    # Wait for API servers
+    wait_for_completion_or_failure(
+        api_server_manager=api_server_manager,
+        engine_manager=local_engine_manager,
+        coordinator=coordinator,
+    )
+
+
+def run_api_server_worker_proc(
+    listen_address, sock, args, client_config=None, **uvicorn_kwargs
+) -> None:
+    """Entrypoint for individual API server worker processes."""
+    client_config = client_config or {}
+    server_index = client_config.get("client_index", 0)
+
+    # Set process title and add process-specific prefix to stdout and stderr.
+    set_process_title("APIServer", str(server_index))
+    decorate_logs()
+
+    uvloop.run(
+        run_server_worker(listen_address, sock, args, client_config, **uvicorn_kwargs)
+    )
+
+
 def main():
-    """Main entry point for python -m vllm.launch_server"""
+    """Main entry point for python -m moe_cap.systems.vllm"""
     
     parser = FlexibleArgumentParser(
-        description="Launch a local OpenAI-compatible API server to serve LLM completions via HTTP. "
-                    "Defaults to Qwen/Qwen3-0.6B if no model is specified.",
-        usage="python -m vllm.launch_server [model_tag] [options]"
+        description=DESCRIPTION,
+        usage="python -m moe_cap.systems.vllm [model_tag] [options]"
     )
     
     parser = make_arg_parser(parser)
@@ -1470,8 +1305,53 @@ def main():
     
     args = parser.parse_args()
     
+    # If model is specified in CLI (as positional arg), it takes precedence
     if hasattr(args, "model_tag") and args.model_tag is not None:
         args.model = args.model_tag
+
+    if args.headless:
+        if args.api_server_count is not None and args.api_server_count > 0:
+            raise ValueError(
+                f"--api-server-count={args.api_server_count} cannot be "
+                "used with --headless (no API servers are started in "
+                "headless mode)."
+            )
+        # Default to 0 in headless mode (no API servers)
+        args.api_server_count = 0
+
+    # Detect LB mode for defaulting api_server_count.
+    is_external_lb = (
+        args.data_parallel_external_lb or args.data_parallel_rank is not None
+    )
+    is_hybrid_lb = (
+        args.data_parallel_hybrid_lb or args.data_parallel_start_rank is not None
+    )
+
+    if is_external_lb and is_hybrid_lb:
+        raise ValueError(
+            "Cannot use both external and hybrid data parallel load "
+            "balancing modes."
+        )
+
+    # Default api_server_count if not explicitly set.
+    if args.api_server_count is None:
+        if is_external_lb:
+            args.api_server_count = 1
+        elif is_hybrid_lb:
+            args.api_server_count = args.data_parallel_size_local or 1
+            if args.api_server_count > 1:
+                logger.info(
+                    "Defaulting api_server_count to data_parallel_size_local "
+                    "(%d) for hybrid LB mode.",
+                    args.api_server_count,
+                )
+        else:
+            args.api_server_count = args.data_parallel_size
+            if args.api_server_count > 1:
+                logger.info(
+                    "Defaulting api_server_count to data_parallel_size (%d).",
+                    args.api_server_count,
+                )
     
     validate_parsed_serve_args(args)
     
@@ -1495,27 +1375,17 @@ def main():
     def patched_build_app(args):
         """Patched build_app that adds custom endpoints."""
         app = original_build_app(args)
-        
-        # vLLM stores the engine in app.state, but we need to access it correctly
-        # The engine is typically set by vLLM's build_app function
-        # We'll access it through the endpoints using dependency injection pattern
-        
         add_custom_endpoints(app)
-        
-        # Note: Auto-start is handled via file-based flag checked in worker processes
-        # The recorder will auto-start when created if EXPERT_DISTRIBUTION_AUTO_START_FLAG_FILE exists
-        
         return app
     
     api_server.build_app = patched_build_app
     
-    if args.headless or args.api_server_count < 1:
-        from vllm.entrypoints.openai.serve import run_headless
+    if args.api_server_count < 1:
         run_headless(args)
     elif args.api_server_count > 1:
-        from vllm.entrypoints.openai.serve import run_multi_api_server
         run_multi_api_server(args)
     else:
+        # Single API server (this process).
         uvloop.run(run_server(args))
 
 
