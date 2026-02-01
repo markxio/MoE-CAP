@@ -153,7 +153,7 @@ async def async_request_openai_completions(
 
 class OpenAIAPIMoEProfiler:
     def __init__(self, config: CAPConfig, output_dir: str = None, api_url: str = None, 
-                 backend: str = "auto", ignore_eos: bool = None):
+                 backend: str = "auto", ignore_eos: bool = None, server_batch_size: int = None):
         """Initialize profiler from a CAPConfig object.
 
         Args:
@@ -163,7 +163,9 @@ class OpenAIAPIMoEProfiler:
             backend: Backend type - "vllm", "sglang", or "auto" (auto-detect).
             ignore_eos: Whether to ignore EOS token for fixed-length generation.
                        If None, auto-set based on fixed_length_mode in config.
+            server_batch_size: The server's max-running-requests setting (for recording purposes).
         """
+        self.server_batch_size = server_batch_size
         # store config
         self.config = config
         self.api_url = api_url
@@ -683,6 +685,7 @@ class OpenAIAPIMoEProfiler:
             res_dict["gpu_type"] = f"{num_gpus}x{gpu_type}"
             res_dict["dataset"] = dataset_name
             res_dict["ignore_eos"] = self.ignore_eos  # Track if ignore_eos was used
+            res_dict["server_batch_size"] = self.server_batch_size  # Server's max-running-requests setting
             # Determine model type based on model name (heuristic)
             res_dict["model_type"] = "instruct" if any(x in self.hf_model_name.lower() for x in ["instruct", "chat"]) else "thinking"
             
@@ -734,6 +737,8 @@ def main():
                        help="Ignore EOS token to force fixed-length output. Auto-enabled for fixed_length_mode.")
     parser.add_argument("--no-ignore-eos", action="store_true",
                        help="Explicitly disable ignore_eos even in fixed_length_mode.")
+    parser.add_argument("--server-batch-size", type=int, default=None,
+                       help="The server's max-running-requests setting. Recorded in output for reference.")
     args = parser.parse_args()
     
     # Handle ignore_eos logic
@@ -802,6 +807,7 @@ def main():
         api_url=args.api_url,
         backend=args.backend,
         ignore_eos=ignore_eos,
+        server_batch_size=args.server_batch_size,
     )
 
     profiler.run(batch_size=args.batch_size)
