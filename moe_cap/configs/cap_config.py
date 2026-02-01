@@ -13,6 +13,10 @@ class CAPConfig:
         dataset_subset: Optional: for datasets with multiple subsets 
                         (e.g "main" for gsm8k, or a specific Longbench task).
         dataset_split: The split to use (e.g "test", "validation").
+        fixed_length_mode: Enable fixed-length benchmarking (no accuracy eval).
+        target_input_tokens: Fixed input length for performance benchmarking.
+        target_output_tokens: Fixed output length for performance benchmarking.
+        num_samples: Number of samples for fixed-length benchmarking.
     """
     dataset_names: List[str]
     metrics: List[str]
@@ -20,3 +24,8 @@ class CAPConfig:
     precision: str = "bfloat16"
     dataset_subset: Optional[str] = None
     dataset_split: str = "test" # Default
+    # Fixed-length benchmarking settings
+    fixed_length_mode: bool = False  # Enable fixed-length mode
+    target_input_tokens: Optional[int] = None
+    target_output_tokens: Optional[int] = None
+    num_samples: Optional[int] = None
