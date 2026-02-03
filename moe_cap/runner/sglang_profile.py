@@ -326,6 +326,7 @@ def main():
     parser.add_argument("--config-file", type=str, help="Path to a JSON or YAML config file that contains CAPConfig fields")
     parser.add_argument("--input-tokens", type=int, default=4000, help="Number of target input tokens")
     parser.add_argument("--output-tokens", type=int, default=1000, help="Number of target output tokens")
+    parser.add_argument("--num-samples", type=int, default=100, help="Number of samples")
     parser.add_argument("--port", type=int, default=30000, help="Port for the SGLang server")
     parser.add_argument("--output_dir", type=str, help="Output directory for metrics (default: ./output)")
     parser.add_argument("--ignore-eos", action="store_true", default=None,
@@ -391,7 +392,7 @@ def main():
         fixed_length_mode=merged.get('fixed_length_mode', False),
         target_input_tokens=merged.get('target_input_tokens', input_tokens),
         target_output_tokens=merged.get('target_output_tokens', output_tokens),
-        num_samples=merged.get('num_samples'),
+        num_samples=merged.get('num_samples', num_samples),
     )
 
     analyzer = SGLangMoEActivationAnalyzer(
