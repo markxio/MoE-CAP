@@ -727,6 +727,9 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_name", type=str, help="HuggingFace model ID (required unless specified in config file)")
     parser.add_argument("--datasets", nargs='+', help="One or more dataset names (e.g. gsm8k), required unless specified in config file")
+    parser.add_argument("--input-tokens", type=int, default=4000, help="Number of target input tokens")
+    parser.add_argument("--output-tokens", type=int, default=1000, help="Number of target output tokens")
+    parser.add_argument("--num-samples", type=int, default=100, help="Number of samples")
     parser.add_argument("--config-file", type=str, help="Path to a JSON or YAML config file that contains CAPConfig fields")
     parser.add_argument("--api-url", type=str, required=True, help="OpenAI-compatible API endpoint URL (e.g., http://localhost:8000/v1/completions)")
     parser.add_argument("--output_dir", type=str, default="./output")
@@ -770,12 +773,21 @@ def main():
     merged = dict(file_cfg or {})
     merged['model_id'] = args.model_name or merged.get('model_id')
     merged['dataset_names'] = args.datasets or merged.get('dataset_names')
+    merged['target_input_tokens'] = args.input_tokens or merged.get('target_input_tokens')
+    merged['target_output_tokens'] = args.output_tokens or merged.get('target_output_tokens')
+    merged['num_samples'] = args.num_samples or merged.get('num_samples')
 
     # Validate required fields
     if not merged.get('model_id'):
         parser.error("--model_name is required (or 'model_id' must be specified in the config file)")
     if not merged.get('dataset_names'):
         parser.error("--datasets is required (or 'dataset_names' must be specified in the config file)")
+    if not merged.get('num_samples'):
+        parser.error("--num-samples is required (or 'num_samples' must be specified in the config file)")
+    if not merged.get('target_input_tokens'):
+        parser.error("--input-tokens is required (or 'target_input_tokens' must be specified in the config file)")
+    if not merged.get('target_output_tokens'):
+        parser.error("--output-tokens is required (or 'target_output_tokens' must be specified in the config file)")
 
     # Validate that all datasets have registered loaders
     from moe_cap.data_loader.loader_registry import _REGISTRY
