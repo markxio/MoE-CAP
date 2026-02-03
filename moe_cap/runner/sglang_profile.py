@@ -324,6 +324,8 @@ def main():
     parser.add_argument("--model_name", type=str, help="HuggingFace model ID (required unless specified in config file)")
     parser.add_argument("--datasets", nargs='+', help="One or more dataset names (e.g. gsm8k), required unless specified in config file")
     parser.add_argument("--config-file", type=str, help="Path to a JSON or YAML config file that contains CAPConfig fields")
+    parser.add_argument("--input-tokens", type=int, default=4000, help="Number of target input tokens")
+    parser.add_argument("--output-tokens", type=int, default=1000, help="Number of target output tokens")
     parser.add_argument("--port", type=int, default=30000, help="Port for the SGLang server")
     parser.add_argument("--output_dir", type=str, help="Output directory for metrics (default: ./output)")
     parser.add_argument("--ignore-eos", action="store_true", default=None,
@@ -387,8 +389,8 @@ def main():
         dataset_subset=merged.get('dataset_subset'),
         dataset_split=merged.get('dataset_split', 'test'),
         fixed_length_mode=merged.get('fixed_length_mode', False),
-        target_input_tokens=merged.get('target_input_tokens'),
-        target_output_tokens=merged.get('target_output_tokens'),
+        target_input_tokens=merged.get('target_input_tokens', input_tokens),
+        target_output_tokens=merged.get('target_output_tokens', output_tokens),
         num_samples=merged.get('num_samples'),
     )
 
