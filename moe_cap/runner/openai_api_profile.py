@@ -730,6 +730,8 @@ def main():
     parser.add_argument("--input-tokens", type=int, default=4000, help="Number of target input tokens")
     parser.add_argument("--output-tokens", type=int, default=1000, help="Number of target output tokens")
     parser.add_argument("--num-samples", type=int, default=100, help="Number of samples")
+    parser.add_argument("--fixed-length-mode", action="store_true", default=None,
+                        help="Enable fixed-length mode for datasets that support it.")
     parser.add_argument("--config-file", type=str, help="Path to a JSON or YAML config file that contains CAPConfig fields")
     parser.add_argument("--api-url", type=str, required=True, help="OpenAI-compatible API endpoint URL (e.g., http://localhost:8000/v1/completions)")
     parser.add_argument("--output_dir", type=str, default="./output")
@@ -776,6 +778,8 @@ def main():
     merged['target_input_tokens'] = args.input_tokens or merged.get('target_input_tokens')
     merged['target_output_tokens'] = args.output_tokens or merged.get('target_output_tokens')
     merged['num_samples'] = args.num_samples or merged.get('num_samples')
+    merged['fixed_length_mode'] = args.fixed_length_mode if args.fixed_length_mode is not None else merged.get('fixed_length_mode', False)
+
 
     # Validate required fields
     if not merged.get('model_id'):
